@@ -8,10 +8,11 @@
 //   3. GPU V2         (sequential addressing — divergence eliminated)
 //   4. GPU V3         (first add during load — half the blocks, 1 fewer barrier)
 //   5. GPU V4         (unroll last warp — remove last 5 barriers)
-//   6. thrust::reduce (library reference baseline)
-//
-// Versions to be added:
-//   7. GPU V5         (warp shuffle — no shared memory for last warp)
+//   6. GPU V5         (warp shuffle — no shared memory for last warp)
+//   7. GPU V6         (hierarchical atomic reduction — single-kernel combine,
+//                       no host-side partial-sum pass; isolates the combine
+//                       strategy change on top of V5's warp-shuffle tail)
+//   8. thrust::reduce (library reference baseline)
 //
 // Build:
 //   nvcc -O2 -o parallel_sum parallel_sum.cu -lm
@@ -24,6 +25,11 @@
 //       --section InstructionStats --section MemoryWorkloadAnalysis \
 //       --section Occupancy --kernel-name reduce_v4_unroll_last_warp \
 //       ./parallel_sum 1048576 2>&1 | head -200
+//
+//   Swap --kernel-name for reduce_v5_shflsync_last_warp or
+//   reduce_v6_hierarchical_reduction to profile those; V6 is worth an
+//   extra look with --section MemoryWorkloadAnalysis to see atomicAdd
+//   contention on the single output address at large N / block count.
 // ============================================================
 
 #include <stdio.h>
@@ -306,6 +312,108 @@ __global__ void reduce_v4_unroll_last_warp(
 }
 
 // ============================================================
+// GPU V5 — V4 + WARP SHUFFLE FOR LAST WARP
+//
+// Replaces warpReduce()'s volatile-shared-memory copies with
+// __shfl_down_sync() register-to-register exchange. Two effects,
+// not one:
+//   (a) performance — no shared-memory traffic / bank conflicts in
+//       the last warp, only register moves.
+//   (b) correctness modernisation — the T4 (Turing, CC 7.5) has
+//       independent thread scheduling. The volatile+implicit-lockstep
+//       trick used by V4 is the pre-Volta idiom; shuffle intrinsics
+//       are the architecturally-guaranteed-correct way to do
+//       intra-warp communication on independent-scheduling GPUs.
+//
+// warpReduceShfl() takes and returns a plain register value (no
+// pointer) — each thread loads its own sdata[tid] into a register
+// before calling it. Only lane 0's returned value is meaningful.
+// ============================================================
+__device__ float warpReduceShfl(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    return val;   // valid only in lane 0
+}
+
+__global__ void reduce_v5_shflsync_last_warp(
+    const float* __restrict__ A,
+    float*       __restrict__ partial_sums,
+    int N)
+{
+    extern __shared__ float sdata[];
+    int   tid       = threadIdx.x;
+    int   global_id = blockIdx.x * (blockDim.x * 2) + tid;
+    float sum       = 0.0f;
+
+    if (global_id < N)              sum += A[global_id];
+    if (global_id + blockDim.x < N) sum += A[global_id + blockDim.x];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Tree reduction down to the last warp (stop at s = 32)
+    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    // Last 5 steps — single warp, register-only via shuffle
+    if (tid < 32) {
+        float val = warpReduceShfl(sdata[tid]);
+        if (tid == 0)
+            partial_sums[blockIdx.x] = val;
+    }
+}
+
+// ============================================================
+// GPU V6 — V5 + HIERARCHICAL ATOMIC REDUCTION
+//
+// Everything through the warp-shuffle tail is identical to V5. The
+// difference is the LAST LINE: instead of writing this block's sum
+// to partial_sums[blockIdx.x] for a later CPU combine pass, lane 0
+// does atomicAdd(output, val) directly into a single global scalar.
+//
+// This is the textbook "hierarchical reduction for arbitrary input
+// length" — one kernel launch, no D2H copy of partial sums, no host
+// loop. Isolates the combine-strategy change against V5; do not read
+// its speedup as "warp shuffle vs V4" — that comparison is V5's job.
+//
+// Consequence for the harness: `output` accumulates on every call,
+// so it MUST be zeroed (cudaMemset) before every launch — unlike
+// partial_sums[], which every block simply overwrites unconditionally.
+// See benchmark_gpu_atomic().
+// ============================================================
+__global__ void reduce_v6_hierarchical_reduction(
+    const float* __restrict__ A,
+    float*       __restrict__ output,
+    int N)
+{
+    extern __shared__ float sdata[];
+    int   tid       = threadIdx.x;
+    int   global_id = blockIdx.x * (blockDim.x * 2) + tid;
+    float sum       = 0.0f;
+
+    if (global_id < N)              sum += A[global_id];
+    if (global_id + blockDim.x < N) sum += A[global_id + blockDim.x];
+    sdata[tid] = sum;
+    __syncthreads();
+
+    // Tree reduction down to the last warp (stop at s = 32)
+    for (int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s)
+            sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+
+    // Last 5 steps — single warp, register-only via shuffle
+    if (tid < 32) {
+        float val = warpReduceShfl(sdata[tid]);
+        if (tid == 0)
+            atomicAdd(output, val);
+    }
+}
+
+// ============================================================
 // BENCHMARK: CPU
 // ============================================================
 BenchResult benchmark_cpu(const float* A, int N) {
@@ -330,10 +438,13 @@ BenchResult benchmark_cpu(const float* A, int N) {
 }
 
 // ============================================================
-// BENCHMARK: GPU KERNEL — generic helper
+// BENCHMARK: GPU KERNEL — generic helper (partial-sums + CPU combine)
 // elems_per_block = BLOCK_SIZE      → V1, V2 (one element / thread)
-// elems_per_block = BLOCK_SIZE * 2  → V3, V4 (two elements / thread)
+// elems_per_block = BLOCK_SIZE * 2  → V3, V4, V5 (two elements / thread)
 // grid_size = ceil(N / elems_per_block)
+//
+// NOT used for V6 — V6 combines via atomicAdd inside the kernel into
+// a single scalar, not per-block partial sums. See benchmark_gpu_atomic.
 // ============================================================
 typedef void (*ReduceKernel)(const float*, float*, int);
 
@@ -399,6 +510,85 @@ float run_once_get_result(
 }
 
 // ============================================================
+// BENCHMARK: GPU KERNEL — atomic-combine variant (V6 only)
+//
+// V6 writes via atomicAdd into a single-float accumulator instead of
+// per-block partial sums, so that accumulator must be reset to 0
+// before every launch — atomicAdd is a += onto whatever is already
+// there, unlike partial_sums[] which every block overwrites outright.
+//
+// The cudaMemset reset is deliberately placed OUTSIDE the timed
+// region, mirroring how benchmark_gpu() excludes its CPU-side combine
+// (reduce_partial_sums_on_cpu) from kernel time. This keeps "kernel
+// time" comparable in spirit across V1-V6, but note the asymmetry
+// this creates: V1-V5's combine cost is paid entirely OUTSIDE the
+// measured kernel (a host loop, off the GPU timeline); V6's combine
+// cost (the atomicAdd itself) is paid entirely INSIDE the measured
+// kernel. So V6's reported time is a more honest single-kernel
+// end-to-end number, while V1-V5's is kernel-only — call this out
+// explicitly in notes.md rather than comparing the numbers naively.
+// ============================================================
+BenchResult benchmark_gpu_atomic(
+    const float*  d_A,
+    int           N,
+    ReduceKernel  kernel,
+    int           elems_per_block)
+{
+    int   grid_size  = (N + elems_per_block - 1) / elems_per_block;
+    int   smem_bytes = BLOCK_SIZE * sizeof(float);
+
+    float* d_output;
+    CUDA_CHECK(cudaMalloc(&d_output, sizeof(float)));
+
+    GPUTimer timer;
+
+    for (int r = 0; r < WARMUP_RUNS; r++) {
+        CUDA_CHECK(cudaMemset(d_output, 0, sizeof(float)));
+        kernel<<<grid_size, BLOCK_SIZE, smem_bytes>>>(d_A, d_output, N);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+
+    float total_ms = 0.0f;
+    for (int r = 0; r < TIMED_RUNS; r++) {
+        CUDA_CHECK(cudaMemset(d_output, 0, sizeof(float)));
+        timer.Start();
+        kernel<<<grid_size, BLOCK_SIZE, smem_bytes>>>(d_A, d_output, N);
+        timer.Stop();
+        total_ms += timer.ElapsedMs();
+    }
+
+    CUDA_CHECK(cudaFree(d_output));
+
+    float avg_ms = total_ms / TIMED_RUNS;
+    BenchResult br;
+    br.N = N; br.time_ms = avg_ms;
+    br.bandwidth_GBs = compute_bw(N, avg_ms);
+    br.pct_peak_bw   = br.bandwidth_GBs / T4_PEAK_BW_GBS * 100.0f;
+    return br;
+}
+
+// ============================================================
+// CORRECTNESS HELPER — atomic-combine variant (V6 only)
+// ============================================================
+float run_once_get_result_atomic(
+    const float*  d_A,
+    int           N,
+    ReduceKernel  kernel,
+    int           elems_per_block)
+{
+    int    grid = (N + elems_per_block - 1) / elems_per_block;
+    float* d_out;
+    CUDA_CHECK(cudaMalloc(&d_out, sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_out, 0, sizeof(float)));
+    kernel<<<grid, BLOCK_SIZE, BLOCK_SIZE * sizeof(float)>>>(d_A, d_out, N);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    float result;
+    CUDA_CHECK(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_out));
+    return result;
+}
+
+// ============================================================
 // BENCHMARK: THRUST
 // ============================================================
 BenchResult benchmark_thrust(const float* d_A, int N) {
@@ -435,6 +625,8 @@ void print_summary(
     const BenchResult* v2,
     const BenchResult* v3,
     const BenchResult* v4,
+    const BenchResult* v5,
+    const BenchResult* v6,
     const BenchResult* thr,
     const int*         Ns,
     int                num_sizes)
@@ -447,79 +639,90 @@ void print_summary(
 
     // ---- Table 1: Time (ms) ----
     printf("\n[1] KERNEL TIME (ms)\n");
-    printf("%-11s %8s %10s %10s %10s %10s %10s\n",
-           "N", "CPU", "V1", "V2", "V3", "V4", "Thrust");
-    printf("%-11s %8s %10s %10s %10s %10s %10s\n",
-           "----------", "------", "--------", "--------", "--------", "--------", "------");
+    printf("%-11s %8s %10s %10s %10s %10s %10s %10s %10s\n",
+           "N", "CPU", "V1", "V2", "V3", "V4", "V5", "V6", "Thrust");
+    printf("%-11s %8s %10s %10s %10s %10s %10s %10s %10s\n",
+           "----------", "------", "--------", "--------", "--------", "--------", "--------", "--------", "------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %8.3f %10.4f %10.4f %10.4f %10.4f %10.4f\n",
+        printf("%-11d %8.3f %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f\n",
                Ns[i], cpu[i].time_ms, v1[i].time_ms, v2[i].time_ms,
-               v3[i].time_ms, v4[i].time_ms, thr[i].time_ms);
+               v3[i].time_ms, v4[i].time_ms, v5[i].time_ms, v6[i].time_ms, thr[i].time_ms);
 
     // ---- Table 2: Bandwidth (GB/s) ----
     printf("\n[2] EFFECTIVE BANDWIDTH (GB/s)  —  T4 Peak: %.0f GB/s\n", T4_PEAK_BW_GBS);
-    printf("%-11s %8s %10s %10s %10s %10s %10s\n",
-           "N", "CPU", "V1", "V2", "V3", "V4", "Thrust");
-    printf("%-11s %8s %10s %10s %10s %10s %10s\n",
-           "----------", "------", "--------", "--------", "--------", "--------", "------");
+    printf("%-11s %8s %10s %10s %10s %10s %10s %10s %10s\n",
+           "N", "CPU", "V1", "V2", "V3", "V4", "V5", "V6", "Thrust");
+    printf("%-11s %8s %10s %10s %10s %10s %10s %10s %10s\n",
+           "----------", "------", "--------", "--------", "--------", "--------", "--------", "--------", "------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %8.1f %10.1f %10.1f %10.1f %10.1f %10.1f\n",
+        printf("%-11d %8.1f %10.1f %10.1f %10.1f %10.1f %10.1f %10.1f %10.1f\n",
                Ns[i], cpu[i].bandwidth_GBs, v1[i].bandwidth_GBs, v2[i].bandwidth_GBs,
-               v3[i].bandwidth_GBs, v4[i].bandwidth_GBs, thr[i].bandwidth_GBs);
+               v3[i].bandwidth_GBs, v4[i].bandwidth_GBs, v5[i].bandwidth_GBs,
+               v6[i].bandwidth_GBs, thr[i].bandwidth_GBs);
 
     // ---- Table 3: % of T4 Peak Bandwidth ----
     printf("\n[3] %% OF T4 PEAK BANDWIDTH (320 GB/s)\n");
-    printf("%-11s %10s %10s %10s %10s %10s\n",
-           "N", "V1", "V2", "V3", "V4", "Thrust");
-    printf("%-11s %10s %10s %10s %10s %10s\n",
-           "----------", "--------", "--------", "--------", "--------", "------");
+    printf("%-11s %10s %10s %10s %10s %10s %10s %10s\n",
+           "N", "V1", "V2", "V3", "V4", "V5", "V6", "Thrust");
+    printf("%-11s %10s %10s %10s %10s %10s %10s %10s\n",
+           "----------", "--------", "--------", "--------", "--------", "--------", "--------", "------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n",
+        printf("%-11d %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n",
                Ns[i], v1[i].pct_peak_bw, v2[i].pct_peak_bw,
-               v3[i].pct_peak_bw, v4[i].pct_peak_bw, thr[i].pct_peak_bw);
+               v3[i].pct_peak_bw, v4[i].pct_peak_bw, v5[i].pct_peak_bw,
+               v6[i].pct_peak_bw, thr[i].pct_peak_bw);
 
     // ---- Table 4: Speedup over CPU ----
     printf("\n[4] SPEEDUP OVER CPU BASELINE\n");
-    printf("%-11s %10s %10s %10s %10s %10s\n",
-           "N", "V1", "V2", "V3", "V4", "Thrust");
-    printf("%-11s %10s %10s %10s %10s %10s\n",
-           "----------", "--------", "--------", "--------", "--------", "------");
+    printf("%-11s %10s %10s %10s %10s %10s %10s %10s\n",
+           "N", "V1", "V2", "V3", "V4", "V5", "V6", "Thrust");
+    printf("%-11s %10s %10s %10s %10s %10s %10s %10s\n",
+           "----------", "--------", "--------", "--------", "--------", "--------", "--------", "------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %9.1fx %9.1fx %9.1fx %9.1fx %9.1fx\n",
+        printf("%-11d %9.1fx %9.1fx %9.1fx %9.1fx %9.1fx %9.1fx %9.1fx\n",
                Ns[i],
                cpu[i].time_ms / v1[i].time_ms,
                cpu[i].time_ms / v2[i].time_ms,
                cpu[i].time_ms / v3[i].time_ms,
                cpu[i].time_ms / v4[i].time_ms,
+               cpu[i].time_ms / v5[i].time_ms,
+               cpu[i].time_ms / v6[i].time_ms,
                cpu[i].time_ms / thr[i].time_ms);
 
     // ---- Table 5: Incremental speedups ----
     printf("\n[5] INCREMENTAL SPEEDUPS (each version vs the previous)\n");
-    printf("%-11s %10s %10s %10s\n", "N", "V2/V1", "V3/V2", "V4/V3");
-    printf("%-11s %10s %10s %10s\n", "----------", "--------", "--------", "--------");
+    printf("%-11s %10s %10s %10s %10s %10s\n", "N", "V2/V1", "V3/V2", "V4/V3", "V5/V4", "V6/V5");
+    printf("%-11s %10s %10s %10s %10s %10s\n", "----------", "--------", "--------", "--------", "--------", "--------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %9.2fx %9.2fx %9.2fx\n",
+        printf("%-11d %9.2fx %9.2fx %9.2fx %9.2fx %9.2fx\n",
                Ns[i],
                v1[i].time_ms / v2[i].time_ms,
                v2[i].time_ms / v3[i].time_ms,
-               v3[i].time_ms / v4[i].time_ms);
+               v3[i].time_ms / v4[i].time_ms,
+               v4[i].time_ms / v5[i].time_ms,
+               v5[i].time_ms / v6[i].time_ms);
 
     // ---- Table 6: Bandwidth as % of Thrust ----
     printf("\n[6] BANDWIDTH AS %% OF THRUST\n");
-    printf("%-11s %10s %10s %10s %10s\n",
-           "N", "V1", "V2", "V3", "V4");
-    printf("%-11s %10s %10s %10s %10s\n",
-           "----------", "--------", "--------", "--------", "--------");
+    printf("%-11s %10s %10s %10s %10s %10s %10s\n",
+           "N", "V1", "V2", "V3", "V4", "V5", "V6");
+    printf("%-11s %10s %10s %10s %10s %10s %10s\n",
+           "----------", "--------", "--------", "--------", "--------", "--------", "--------");
     for (int i = 0; i < num_sizes; i++)
-        printf("%-11d %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n",
+        printf("%-11d %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n",
                Ns[i],
                v1[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f,
                v2[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f,
                v3[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f,
-               v4[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f);
+               v4[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f,
+               v5[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f,
+               v6[i].bandwidth_GBs / thr[i].bandwidth_GBs * 100.0f);
 
     printf("\nNote: GPU bandwidth = N * sizeof(float) / kernel_time\n");
     printf("      (reads N elements, writes 1 scalar — read-dominated)\n");
+    printf("      V6's kernel time includes its atomicAdd combine; V1-V5's\n");
+    printf("      combine (CPU loop / register write) is excluded — see\n");
+    printf("      benchmark_gpu_atomic()'s comment before comparing V6 to V1-V5.\n");
 }
 
 // ============================================================
@@ -540,7 +743,7 @@ int main(int argc, char** argv) {
 
     printf("============================================================\n");
     printf("HPS GPU Lab -- Experiment 3: Parallel Reduction\n");
-    printf("Versions: CPU | V1 | V2 | V3 | V4 | Thrust\n");
+    printf("Versions: CPU | V1 | V2 | V3 | V4 | V5 | V6 | Thrust\n");
     printf("Block size: %d  |  Warmup: %d  |  Timed: %d\n",
            BLOCK_SIZE, WARMUP_RUNS, TIMED_RUNS);
     printf("============================================================\n");
@@ -558,6 +761,8 @@ int main(int argc, char** argv) {
     BenchResult* v2_res  = new BenchResult[num_sizes];
     BenchResult* v3_res  = new BenchResult[num_sizes];
     BenchResult* v4_res  = new BenchResult[num_sizes];
+    BenchResult* v5_res  = new BenchResult[num_sizes];
+    BenchResult* v6_res  = new BenchResult[num_sizes];
     BenchResult* thr_res = new BenchResult[num_sizes];
 
     for (int i = 0; i < num_sizes; i++) {
@@ -622,6 +827,31 @@ int main(int argc, char** argv) {
                    v4_res[i].time_ms, v4_res[i].bandwidth_GBs, v4_res[i].pct_peak_bw, ok ? "OK" : "FAIL");
         }
 
+        // ---- V5 (warp shuffle for last warp, 2 elems/thread → half blocks) ----
+        printf("  V5 ShflSync...    "); fflush(stdout);
+        v5_res[i] = benchmark_gpu(d_A, N, reduce_v5_shflsync_last_warp, BLOCK_SIZE * 2);
+        {
+            float gpu = run_once_get_result(d_A, N, reduce_v5_shflsync_last_warp, BLOCK_SIZE * 2);
+            bool  ok  = verify(cpu_sum, gpu, N);
+            printf("%.4f ms  (%.1f GB/s, %.1f%% peak)  [%s]\n",
+                   v5_res[i].time_ms, v5_res[i].bandwidth_GBs, v5_res[i].pct_peak_bw, ok ? "OK" : "FAIL");
+        }
+
+        // ---- V6 (hierarchical atomic reduction, 2 elems/thread → half blocks) ----
+        // Uses benchmark_gpu_atomic / run_once_get_result_atomic, NOT the
+        // partial_sums helpers above — V6 combines via atomicAdd inside
+        // the kernel into a single scalar, so its result buffer is one
+        // float, not a grid_size-length array. See that function's
+        // comment for why it must be zeroed before every launch.
+        printf("  V6 Hierarchical...");
+        v6_res[i] = benchmark_gpu_atomic(d_A, N, reduce_v6_hierarchical_reduction, BLOCK_SIZE * 2);
+        {
+            float gpu = run_once_get_result_atomic(d_A, N, reduce_v6_hierarchical_reduction, BLOCK_SIZE * 2);
+            bool  ok  = verify(cpu_sum, gpu, N);
+            printf("%.4f ms  (%.1f GB/s, %.1f%% peak)  [%s]\n",
+                   v6_res[i].time_ms, v6_res[i].bandwidth_GBs, v6_res[i].pct_peak_bw, ok ? "OK" : "FAIL");
+        }
+
         // ---- Thrust ----
         printf("  Thrust...         "); fflush(stdout);
         thr_res[i] = benchmark_thrust(d_A, N);
@@ -637,9 +867,10 @@ int main(int argc, char** argv) {
         free(h_A);
     }
 
-    print_summary(cpu_res, v1_res, v2_res, v3_res, v4_res, thr_res, sizes, num_sizes);
+    print_summary(cpu_res, v1_res, v2_res, v3_res, v4_res, v5_res, v6_res, thr_res, sizes, num_sizes);
 
     delete[] cpu_res; delete[] v1_res; delete[] v2_res;
-    delete[] v3_res;  delete[] v4_res; delete[] thr_res;
+    delete[] v3_res;  delete[] v4_res; delete[] v5_res;
+    delete[] v6_res;  delete[] thr_res;
     return 0;
 }

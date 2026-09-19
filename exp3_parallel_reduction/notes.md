@@ -134,11 +134,54 @@ magnitude, and wrong on the N-scaling.
 **Predicted speedup over V4: 1.2-1.5x.**
 No shared memory for last warp, no barriers for final 5 steps.
 
-### 3.7 Thrust Reference
+**MEASURED: 1.04x (1M), 1.08x (4M), 1.10x (16M), 1.15x (64M) — median of 4
+clean runs.** Undershot the predicted range at every N, and the *shape* was
+wrong too. The hypothesis (formed after understanding V4's plateau-then-jump,
+§7.6) was: "V5 helps at small N — latency-bound, fewer dependent shared-mem
+ops in the tail — and barely moves large N, since V4 is already at the
+memory wall with no headroom." Measured is flat-to-slightly-*rising* with
+N — the opposite direction. ncu on V6 (§6.9, which shares V5's shuffle tail)
+explains why: Warp Cycles Per Issued Instruction stayed at 19.88 —
+statistically the same as V4's 18.4 and V3's 20.1 — and the dominant stall
+(34.7%, "L1TEX scoreboard dependency," i.e. long-scoreboard) comes from the
+global-load / early tree-reduction phase, not the last-warp shared-memory
+traffic shuffle replaced. Right direction, small magnitude, wrong shape —
+see §7.7 for the full account.
+
+### 3.7 Version 6 — Hierarchical Atomic Reduction
+
+*(Not in the original problem.md — added after reading PMPP's "hierarchical
+reduction for arbitrary input length," which combines block results via a
+single-kernel `atomicAdd` instead of this file's original two-pass
+partial-sums + CPU-combine approach.)*
+
+**Predicted: replacing the per-block write + CPU combine with
+`atomicAdd(output, val)` costs measurably more per block (atomic RMW
+contention across ~131,072 blocks funnelling into one 4-byte address at
+N=64M), but wins on architecture — one kernel launch, no D2H copy, no host
+loop, works for arbitrary N.**
+
+**MEASURED: V6/V5 = 0.98-1.03x across N (median of 4 runs) — statistically
+indistinguishable from V5, not slower.** The predicted contention cost did
+not materialise. Only `40 SMs × 4 resident blocks/SM = 160` blocks are
+actually executing at any instant, out of 131,072 total at N=64M, so the
+atomicAdd calls are naturally staggered across the kernel's lifetime rather
+than genuinely simultaneous. See §7.8 for the full explanation. Prediction
+direction was wrong: this turned out to be a free architectural upgrade, not
+a performance/simplicity tradeoff.
+
+### 3.8 Thrust Reference
 
 **Predicted: V5 reaches 50-70% of Thrust bandwidth.**
 
-### 3.8 Predicted Summary Table
+**MEASURED: V5 reaches 97-594% of Thrust across N** — 97% at 16M (Thrust's
+best showing, actually ~3% ahead of V5 there), up to 594% at 1M (Thrust's
+fixed dispatch overhead dominates at small N), and 122% at 64M. The
+prediction assumed V5 would still trail Thrust everywhere; instead V4
+already matched/beat Thrust at 64M (§4.6), and V5/V6 extend that lead
+further at every N except 16M.
+
+### 3.9 Predicted Summary Table
 
 | Version | Key Mechanism | Predicted BW | % of Peak |
 |---------|-------------|-------------|-----------|
@@ -148,6 +191,7 @@ No shared memory for last warp, no barriers for final 5 steps.
 | V3 | Half sync barriers | 130-180 GB/s | 40-56% |
 | V4 | No barriers last warp | 150-200 GB/s | 47-62% |
 | V5 | Warp shuffle | 180-220 GB/s | 56-69% |
+| V6 | Hierarchical atomic combine | ~= V5 (no cost predicted to hold) | ~= V5 |
 | Thrust | All optimisations | ~260-280 GB/s | 80-87% |
 
 ---
@@ -308,6 +352,142 @@ N*, not "faster than Thrust" — Thrust wins at 16M (156 vs 129) and at the smal
 sizes. Thrust is tuned for robustness across all sizes and data types; V4 is
 hand-fit to exactly this problem (float sum, this N, this GPU), so at the largest
 size the specialisation edges ahead.
+
+### 4.7 Version 5 Results — Warp Shuffle
+
+Bandwidth (median of 4 confirmed-same-hardware runs; methodology in §4.10):
+
+| N | V4 GB/s | V5 GB/s | V5/V4 |
+|---|---|---|---|
+| 1M | 129.9 | 135.2 | 1.04x |
+| 4M | 138.2 | 149.6 | 1.08x |
+| 16M | 129.0 | 142.2 | 1.10x |
+| 64M | 220.1 | 253.7 | 1.15x |
+
+Correctness: `[OK]` at every N, every run.
+
+The gain is real (positive in all 4 runs, all N) but small, and
+**flat-to-slightly-rising with N** rather than shrinking as N grows — see
+§3.6 for why this contradicts the stated hypothesis and §7.7 for the ncu
+evidence explaining the shape.
+
+### 4.8 Version 6 Results — Hierarchical Atomic Reduction
+
+Bandwidth (median of 4 confirmed-same-hardware runs):
+
+| N | V5 GB/s | V6 GB/s | V6/V5 |
+|---|---|---|---|
+| 1M | 135.2 | 139.3 | 1.03x |
+| 4M | 149.6 | 146.3 | 0.98x |
+| 16M | 142.2 | 143.2 | 1.01x |
+| 64M | 253.7 | 254.7 | 1.00x |
+
+Correctness: `[OK]` at every N, every run — the single `atomicAdd` combine
+produces results within the same N-scaled tolerance as every other version.
+
+**V6/V5 is statistically flat (0.98-1.03x) — replacing the two-pass
+CPU-combine with a single-kernel atomicAdd combine costs nothing
+measurable.** See §3.7 and §7.8 for why (block *residency*, not block
+*count*, bounds real atomic contention).
+
+**A methodology warning, learned the hard way:** profiling V6 with
+`ncu --kernel-name reduce_v6_hierarchical_reduction` on this same binary
+produced a program-reported time of **3122 ms** at N=64M — a ~2800x
+inflation from the real value. This is not a real regression. `--kernel-name`
+re-instruments *every* host-level launch whose name matches — here, all
+`WARMUP_RUNS(3) + TIMED_RUNS(10) + 1 correctness call = 14` launches — and
+this program's own `GPUTimer` faithfully times that instrumented execution
+because it wraps the exact same launch ncu is replaying underneath it. V1-V5
+in that same profiled process reported normal times because their kernel
+names didn't match the filter and ran unprofiled at native speed. ncu's own
+internal `Duration` metric for the profiled kernel read 1.90 ms — consistent
+with the real value (~0.93-1.12 ms across runs) once light SOL-section
+overhead is accounted for. **Rule going forward: never trust this program's
+own printed BenchResult time/bandwidth from a run with ncu attached to a
+repeatedly-launched kernel — trust only ncu's own reported Duration and its
+ratio/percentage metrics, or use `--launch-skip`/`--launch-count 1` to limit
+which single invocation gets the expensive multi-pass treatment.**
+
+### 4.9 Final Consolidated Table — All Versions (Median of 4 Clean Runs)
+
+**Methodology:** 4 independent `./parallel_sum` invocations, same Colab
+session, confirmed identical hardware (`Tesla T4, CC 7.5, 40 SMs, 320 GB/s
+peak, 8141 GFLOPS peak` printed identically in every run's header). A 5th
+run was discarded — it showed V1 at 63.0 GB/s at N=1M (every other run:
+24.5-30.5 GB/s) and V4 slower than V3 at N=4M (mechanistically implausible,
+since V4 is strictly more optimised than V3) — both signs of an anomalous
+run rather than a real measurement. The value shown is the **median** across
+the 4 remaining runs at each cell, chosen over the mean for robustness to
+the residual single-run flukes documented in §4.10.
+
+Effective bandwidth (GB/s):
+
+| N | CPU | V1 | V2 | V3 | V4 | V5 | V6 | Thrust |
+|---|---|---|---|---|---|---|---|---|
+| 1M | 1.2 | 27.1 | 43.9 | 84.0 | 129.9 | 135.2 | 139.3 | 22.8 |
+| 4M | 1.1 | 29.3 | 47.4 | 89.4 | 138.2 | 149.6 | 146.3 | 62.7 |
+| 16M | 1.2 | 25.5 | 41.8 | 80.1 | 129.0 | 142.2 | 143.2 | 147.2 |
+| 64M | 1.2 | 26.1 | 76.6 | 146.7 | 220.1 | 253.7 | 254.7 | 207.3 |
+
+% of T4 peak bandwidth (320 GB/s):
+
+| N | V1 | V2 | V3 | V4 | V5 | V6 | Thrust |
+|---|---|---|---|---|---|---|---|
+| 1M | 8.5% | 13.7% | 26.2% | 40.6% | 42.3% | 43.5% | 7.1% |
+| 4M | 9.2% | 14.8% | 27.9% | 43.2% | 46.8% | 45.7% | 19.6% |
+| 16M | 8.0% | 13.1% | 25.0% | 40.3% | 44.4% | 44.8% | 46.0% |
+| 64M | 8.1% | 23.9% | 45.8% | 68.8% | 79.3% | 79.6% | 64.8% |
+
+**Headline: V5 and V6 both cross into the high-70s% of peak bandwidth at
+N=64M — the best of the hand-written kernels — and both beat Thrust
+comfortably at every N except 16M**, where Thrust edges ahead by ~3%
+(147.2 vs 142-143 GB/s).
+
+**A finding this median data adds that the original single-run notes
+missed:** V2 is *not* purely flat across N the way V1 is. V1 stays at
+~25-29 GB/s from 1M through 64M — fully sync-bound, immune to scale. V2
+rises from ~42-47 GB/s at 1M-16M to 76.6 GB/s at 64M, a ~1.7x jump with no
+counterpart in V1. The same cross-block-overlap mechanism documented for V4
+in §7.6 (deep enough wave-overlap hides a per-block fixed cost) appears to
+partially apply to V2 and V3 as well at 64M — they still carry barriers V4
+removed, but enough concurrent blocks are in flight at 131,072-block scale
+that *some* of that fixed overhead gets hidden too, just less completely
+than for V4/V5/V6. V1 never benefits: its bottleneck (warp divergence in
+every barrier step) isn't something cross-block scheduling can hide.
+
+### 4.10 Measurement Reliability on Shared Colab T4
+
+Coefficient of variation (std/mean) across the 4 clean runs:
+
+| Version | CV @ N=16M | CV @ N=64M | Regime at 64M |
+|---|---|---|---|
+| V1 | 5.3% | 4.2% | fully sync-bound |
+| V2 | 5.3% | 17.3% | transitioning |
+| V3 | 5.5% | 16.9% | transitioning |
+| V4 | 3.9% | 12.9% | **at the plateau→jump threshold** |
+| V5 | 3.9% | 6.1% | fully memory-bound |
+| V6 | 4.1% | 7.4% | fully memory-bound |
+| Thrust | 9.6% | 6.4% | fully memory-bound (library) |
+
+**The pattern is not "large N is noisy" or "memory-bound kernels are
+noisy" — it is specifically V2/V3/V4 at N=64M.** At N=16M every version
+sits at a uniform, low 4-6% CV. At N=64M, the versions sitting exactly at
+the crossover between sync-bound and memory-bound behaviour (V2, V3, and
+especially V4 — see §7.6) show 3-4x the variance of versions solidly on
+either side of that threshold (V1, always sync-bound; V5/V6/Thrust, solidly
+memory-bound at 64M). A kernel balanced right on a regime boundary is
+sensitive to small differences in actual achieved cross-block concurrency —
+plausibly perturbed run to run on a shared, multi-tenant Colab T4 instance
+(co-tenancy, thermal state, dynamic boost clocks) — while a kernel solidly
+on one side of that boundary is not.
+
+**Practical consequence:** ratios are far more trustworthy than absolute
+GB/s numbers on this hardware. V4/V3 at 64M ranged 1.46x-1.66x across the 4
+runs (~7% spread) while V3's own raw GB/s ranged 98.9-160.3 (~48% spread) —
+common-mode noise from the shared instance cancels out when comparing two
+kernels measured in the *same* run, but not when comparing one kernel's
+absolute number *across* runs. Trust the speedup / incremental-speedup
+tables more than any single absolute bandwidth number at N≥64M.
 
 ---
 
@@ -576,6 +756,79 @@ streaming kernel is healthy. (The same metric on matmul would be a disaster,
 where reuse is the whole point.) Always interpret a metric against what the
 algorithm *should* do.
 
+### 6.9 V6 ncu Analysis — Confirming the Bottleneck Didn't Move
+
+**Methodology warning — read before the numbers:** this program's own
+printed time for V6 in the profiling run was 3122 ms, a ~2800x inflation
+from ncu re-instrumenting all 14 host-level launches of the matched kernel
+name (3 warmup + 10 timed + 1 correctness call). That number is discarded
+entirely — full explanation in §4.8. Everything below uses ncu's own
+internal per-pass metrics, which are normalised/relative and not subject to
+that inflation.
+
+**Speed of Light (profiled at N=64M):**
+
+| Metric | Value | Reading |
+|--------|-------|---------|
+| Memory Throughput | 53.6% | moderate |
+| DRAM Throughput | 53.6% | moderate |
+| Compute (SM) Throughput | 51.3% | moderate, balanced with memory |
+| ncu's own note | — | "below 60% typically indicates latency issues" |
+
+Both pipelines sit around 51-54% — neither saturated. ncu's own diagnostic
+points at latency, not a raw bandwidth or compute ceiling.
+
+**Warp State Statistics:**
+
+| Metric | V3 (old) | V4 (old) | V6 | Reading |
+|--------|----|----|----|---------|
+| Warp Cycles Per Issued Instruction | 20.1 | 18.4 | **19.88** | unchanged within noise across V3→V4→V6 |
+| Avg. Active Threads Per Warp | — | — | 31.77 | near-full warps |
+| Avg. Not Predicated Off Threads | 20.8 | 26.9 | **26.41** | matches V4, not further improved |
+
+**This is the key finding: V6 (warp shuffle + atomic combine) did not move
+the needle on warp-level stalling relative to V4.** If shuffle and the
+atomic combine were fixing the dominant bottleneck, this number should have
+dropped meaningfully. It didn't.
+
+**Stall reason — still long-scoreboard, still ~35%:**
+
+> "On average, each warp of this workload spends 6.9 cycles being stalled
+> waiting for a scoreboard dependency on a L1TEX (local, global, surface,
+> texture) operation... about 34.7% of the total average of 19.9 cycles."
+
+This is specifically a **long-scoreboard** stall — waiting on the L1TEX path
+(global/local/texture/surface memory round trips) — not a **short-scoreboard**
+stall (which would mean waiting on shared-memory/MIO-path operations). V4's
+old analysis (§6.8) found the same stall category at nearly the same
+magnitude (~33%). Neither warp shuffle (touches only shared-memory traffic
+in the last warp) nor the atomic combine (one instruction at the very end
+of the kernel) had reason to move a stall that originates in the
+global-load / early tree-reduction phase — and the counters confirm they
+didn't. See §7.7 for what this means for the V5 hypothesis.
+
+**Occupancy:**
+
+| Metric | V4 (old) | V6 |
+|--------|----------|-----|
+| Theoretical | 100% | 100% |
+| Achieved | 72.7% | **75.0%** |
+
+A small improvement over V4 — plausibly the unrolled shuffle sequence having
+fewer instructions in the tail than the volatile-shared-memory version,
+slightly shortening the low-occupancy tail window. Not the dominant effect.
+
+**One ncu suggestion to ignore:** ncu's OPT note flags "4,849,664 non-fused
+FP32 instructions... converting pairs to FMA could increase performance up
+to 50%." **Not applicable here** — this is a pure-sum reduction with no
+multiply operand anywhere in the kernel, so there is nothing to fuse into an
+FMA. This is a generic advisory ncu attaches to any kernel with many plain
+FADD instructions; it isn't a real opportunity for this algorithm.
+
+**Cache hit rates (L1 0%, L2 1.6%) are correct, not a problem** — same
+reasoning as V4's analysis (§6.8): a streaming reduction touches each
+element exactly once, so near-zero reuse is the expected, healthy signature.
+
 ---
 
 ## 7. Interpretation
@@ -747,9 +1000,68 @@ V5 barely moves LARGE N (already memory-bound at 80% peak — no headroom)
 If confirmed, this is itself a valuable finding: the roofline model predicting
 that compute optimisation stops paying off once the memory wall is reached.
 
+### 7.7 V5's Hypothesis, Falsified — And What Actually Explains It
+
+The hypothesis above predicted V5 would help most at small N and barely move
+large N, reasoning that V4 is already memory-bound (80% of peak) at 64M, so
+compute/latency wins should have no headroom left there.
+
+**Measured (median of 4 runs): V5/V4 = 1.04x (1M), 1.08x (4M), 1.10x (16M),
+1.15x (64M) — flat-to-rising, the opposite of the predicted shape.**
+
+The hypothesis's reasoning was sound but aimed at the wrong bottleneck. It
+assumed the memory wall observed in *aggregate* bandwidth (§7.6) was the
+binding constraint everywhere in the kernel, so removing a small last-warp
+cost would have nothing left to win once that wall is hit. But ncu on V6
+(§6.9, sharing V5's shuffle tail) shows the actual dominant stall — 34.7%,
+long-scoreboard, waiting on L1TEX/global-memory round trips — sits in the
+*load / early tree-reduction* phase, not the last warp. Being "memory-bound
+in aggregate" doesn't mean every code region is equally memory-bound; the
+last-warp shared-memory traffic shuffle replaced was never the dominant
+cost at any N, so removing it delivers a similarly small, roughly
+N-independent win everywhere — exactly the flat-to-slightly-rising shape
+measured. The slight rise with N is more likely a secondary effect of the
+same cross-block-overlap mechanism from §7.6 (more blocks in flight at
+large N means the last-warp savings are also better hidden/amortised) than
+the mechanism the original hypothesis proposed.
+
+**The general lesson:** a roofline-level "memory-bound" verdict describes
+the kernel in aggregate; it does not say where inside the kernel the
+remaining stall time actually lives. That requires the warp-state/stall-
+reason breakdown, not the Speed-of-Light section alone — precisely the
+diagnostic order §6.7 already lays out.
+
+### 7.8 Why the Hierarchical Atomic Combine Is Free
+
+V6 replaces V5's per-block `partial_sums[blockIdx.x] = val` (one plain
+write) with `atomicAdd(output, val)` (one atomic read-modify-write to a
+single, block-shared address). Naively, funnelling 131,072 blocks'-worth of
+atomics (at N=64M) into one 4-byte location sounds like a serialisation
+bottleneck. Measured, it costs 0.98-1.03x — indistinguishable from noise.
+
+The reason is occupancy math, the same kind used throughout §7.6: only
+`40 SMs × 4 resident blocks/SM = 160` blocks are actually executing at any
+given instant, not all 131,072 simultaneously. Contention on the output
+address is bounded by however many of those ~160 blocks happen to finish
+their local reduction and reach the atomicAdd at the same moment — a much
+smaller, naturally staggered number, not the full block count. Turing's L2
+cache also accelerates atomics with a hardware combining path for exactly
+this pattern (many RMWs to one resident cache line). The single atomic
+instruction per block is a vanishingly small fraction of each block's own
+work (a 512-element local reduction), so even a nonzero atomic cost would
+be hard to see above run-to-run noise (§4.10).
+
+**Practical implication:** for reductions where the combine step would
+otherwise require a second kernel launch, a D2H copy, or host-side code,
+the atomic-combine pattern is close to free on modern hardware as long as
+block *residency* (not total block *count*) stays reasonable. The classic
+worry about "atomic contention" applies far more to designs where many
+*threads within a single wave* hit the same address (e.g. one atomicAdd
+per thread instead of per block), not to this one-atomic-per-block pattern.
+
 ---
 
-## 8. Key Takeaways (V1 through V4)
+## 8. Key Takeaways (V1 through V6)
 
 **V1 is sync-bound, not memory-bound.** Despite the roofline model predicting
 memory-bound behaviour, V1 achieves only 8% of peak bandwidth because 31.4%
@@ -803,23 +1115,61 @@ divergence (V1→V2) → memory access pattern (V2→V3) → barriers (V3→V4) 
 latency (the current V4 ceiling). The ncu stall-reason metric is what makes each
 layer visible.
 
+**V5 — a real but small win, and a falsified hypothesis.** Warp shuffle
+replaced V4's volatile-shared-memory last-warp reduction, gaining a
+consistent but modest 1.04-1.15x across N — flat-to-rising, not the
+small-N-only pattern predicted in §7.6. ncu confirms why: the dominant
+stall (long-scoreboard, ~35%, unchanged from V4) lives in the load/early
+tree-reduction phase, a region shuffle never touches. Being "memory-bound
+in aggregate" does not mean every part of the kernel is memory-bound — the
+layers-peel-one-at-a-time lesson from V1→V4 has a corollary: not every
+remaining layer is reachable by every optimisation.
+
+**V6 — the hierarchical atomic combine is architecturally superior at zero
+cost.** Replacing the two-pass CPU combine (D2H copy + host loop) with a
+single `atomicAdd` into one global scalar measured at 0.98-1.03x of V5 —
+statistically free. Block *residency* (~160 concurrent blocks on this GPU),
+not total block *count* (131,072 at 64M), bounds real atomic contention,
+which is why this pattern scales without a measurable tax. V5 and V6 both
+now sit at ~79-80% of T4 peak bandwidth and beat Thrust at every N except
+16M.
+
+**A new methodological lesson from repeated runs: variance is a threshold
+phenomenon, not a large-N phenomenon.** Re-running the full sweep multiple
+times on the same (confirmed identical) Colab T4 showed uniform 4-6% CV
+across all versions at N=16M, but 13-17% CV specifically for V2, V3, and V4
+at N=64M — the versions sitting at or near the plateau→jump crossover
+(§7.6) — while V1 (always sync-bound) and V5/V6/Thrust (solidly
+memory-bound at 64M) stayed at 4-7% CV even at 64M. A kernel balanced on a
+regime boundary is fragile to small run-to-run differences in achieved
+concurrency; one solidly on either side is not. Ratios between kernels
+measured in the same run are far more trustworthy than any single kernel's
+absolute bandwidth compared across runs (§4.10).
+
 ---
 
-## 9. Versions Still To Be Implemented
+## 9. Versions Implemented — Status
 
-| Version | Change | Target Metric | Result / Expected |
+| Version | Change | Target Metric | Result |
 |---------|--------|--------------|--------------|
-| V3 | First add during load | DRAM throughput 19→34%, bandwidth↑ | ✓ DONE — 1.92× over V2 |
-| V4 | Unroll last warp | Stall flips barrier→memory; occupancy 89→73% | ✓ DONE — 2.75× over V3 at 64M |
-| V5 | Warp shuffle for last warp | Removes volatile shared-mem round-trips | small N: helps; large N: ~flat |
-| Thrust comparison | Library baseline | Full pipeline | V4 already competitive at 64M |
+| V3 | First add during load | DRAM throughput 19→34%, bandwidth↑ | ✓ DONE — 1.92x over V2 |
+| V4 | Unroll last warp | Stall flips barrier→memory; occupancy 89→73% | ✓ DONE — 1.44-1.66x over V3 at 64M (median of 4 runs) |
+| V5 | Warp shuffle for last warp | Removes volatile shared-mem round-trips | ✓ DONE — 1.04-1.15x over V4, flat-to-rising with N (hypothesis falsified — §7.7) |
+| V6 | Hierarchical atomic reduction | Single-kernel combine, no host pass | ✓ DONE — 0.98-1.03x of V5, statistically free (§7.8) |
+| Thrust comparison | Library baseline | Full pipeline | V5/V6 beat Thrust at every N except 16M |
 
-At N=64M, V4 reaches **80% of peak bandwidth** and exceeds Thrust (256 vs 214).
-The remaining headroom is mostly at small-to-mid N, where the occupancy tail and
-latency dominate. **V5 hypothesis (explicit): warp shuffle helps at small N
-(latency-bound) but barely moves 64M (already memory-bound — roofline says
-compute wins are wasted at the memory wall).** Testing this is the point of V5.
+At N=64M (median of 4 runs), V5/V6 reach **~79-80% of peak bandwidth**,
+exceeding Thrust (254 vs 207 GB/s). Both hypotheses formed after V4 (§7.6's
+V5 prediction, and the atomic-contention prediction in §3.7) were
+directionally wrong but usefully so — see §7.7 and §7.8 for what the ncu
+counters revealed instead.
 
-The remaining gap to a theoretical-best kernel: vectorised loads (float4) to cut
-the number of load instructions, and possibly grid-stride loops to tune the
-block count independently of N.
+**Not implemented — deliberately out of scope for now:**
+- General thread coarsening (`COARSE_FACTOR` swept as a parameter, rather
+  than V3/V4/V5/V6's fixed factor of 2). This is PMPP's own generalisation
+  of what V3 already does in miniature; worth a dedicated V7 if revisited.
+- Vectorised loads (`float4`) to cut load-instruction count — flagged as
+  remaining headroom back in the V4 write-up, still open.
+- Bank-conflict measurement via ncu's dedicated shared-memory counters —
+  the bank-conflict analysis in problem.md §4 remains conceptual only,
+  never measured directly.
